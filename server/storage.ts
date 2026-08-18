@@ -1,9 +1,11 @@
 import fs from 'fs';
 import path from 'path';
+import { DatabaseSync } from 'node:sqlite';
 import { InventoryCategory, InventoryItem } from '../src/types';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
-const DATA_FILE = path.join(DATA_DIR, 'inventory.json');
+const DB_FILE = path.join(DATA_DIR, 'inventory.db');
+const LEGACY_JSON_FILE = path.join(DATA_DIR, 'inventory.json');
 
 export const INITIAL_SAMPLE_ITEMS: InventoryItem[] = [
   // Malts
@@ -231,39 +233,310 @@ export const INITIAL_SAMPLE_ITEMS: InventoryItem[] = [
   },
 ];
 
+interface SQLiteItemRow {
+  id: string;
+  name: string;
+  category: string;
+  quantity: number;
+  unit: string;
+  notes: string | null;
+  min_threshold: number | null;
+  lot_number: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+let dbInstance: DatabaseSync | null = null;
+
 function ensureDataDirectory(): void {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
 }
 
-export function loadInventory(): InventoryItem[] {
-  ensureDataDirectory();
-  if (!fs.existsSync(DATA_FILE)) {
-    saveInventory(INITIAL_SAMPLE_ITEMS);
-    return INITIAL_SAMPLE_ITEMS;
+function rowToItem(row: SQLiteItemRow): InventoryItem {
+  return {
+    id: row.id,
+    name: row.name,
+    category: row.category as InventoryCategory,
+    quantity: row.quantity,
+    unit: row.unit,
+    notes: row.notes || '',
+    minThreshold: row.min_threshold !== null && row.min_threshold !== undefined ? Number(row.min_threshold) : 0,
+    lotNumber: row.lot_number || undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function getDatabase(): DatabaseSync {
+  if (dbInstance) {
+    return dbInstance;
   }
-  try {
-    const raw = fs.readFileSync(DATA_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) {
-      return parsed;
+
+  ensureDataDirectory();
+  const db = new DatabaseSync(DB_FILE);
+
+  // Performance and concurrency settings
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA foreign_keys = ON;
+  `);
+
+  // Schema creation
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS items (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      category TEXT NOT NULL CHECK(category IN ('Malts', 'Hops', 'Yeast', 'Misc')),
+      quantity REAL NOT NULL DEFAULT 0 CHECK(quantity >= 0),
+      unit TEXT NOT NULL,
+      notes TEXT DEFAULT '',
+      min_threshold REAL DEFAULT 0,
+      lot_number TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_items_category ON items(category);
+    CREATE INDEX IF NOT EXISTS idx_items_name ON items(name);
+  `);
+
+  // Migration & seed verification
+  const countRow = db.prepare('SELECT COUNT(*) as count FROM items').get() as { count: number } | undefined;
+  const count = countRow?.count ?? 0;
+
+  if (count === 0) {
+    let migratedFromLegacy = false;
+
+    // Check if legacy inventory.json exists for automatic one-time migration
+    if (fs.existsSync(LEGACY_JSON_FILE)) {
+      try {
+        const rawJson = fs.readFileSync(LEGACY_JSON_FILE, 'utf-8');
+        const parsed = JSON.parse(rawJson);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          insertItemsTransaction(db, parsed);
+          migratedFromLegacy = true;
+          console.log(`[SQLite Migration] Successfully migrated ${parsed.length} items from ${LEGACY_JSON_FILE} into SQLite database ${DB_FILE}. (Preserved JSON file as backup)`);
+        }
+      } catch (err) {
+        console.error('[SQLite Migration] Warning: Failed to parse existing inventory.json for migration:', err);
+      }
     }
-    return INITIAL_SAMPLE_ITEMS;
+
+    // If no legacy items imported, seed with sample items
+    if (!migratedFromLegacy) {
+      insertItemsTransaction(db, INITIAL_SAMPLE_ITEMS);
+      console.log(`[SQLite Database] Initialized and seeded ${INITIAL_SAMPLE_ITEMS.length} sample brewery items into ${DB_FILE}`);
+    }
+  }
+
+  dbInstance = db;
+  return dbInstance;
+}
+
+function insertItemsTransaction(db: DatabaseSync, items: InventoryItem[]): void {
+  const insertStmt = db.prepare(`
+    INSERT OR REPLACE INTO items (
+      id, name, category, quantity, unit, notes, min_threshold, lot_number, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  db.exec('BEGIN TRANSACTION');
+  try {
+    for (const item of items) {
+      insertStmt.run(
+        item.id,
+        item.name,
+        item.category,
+        item.quantity,
+        item.unit,
+        item.notes || '',
+        item.minThreshold ?? 0,
+        item.lotNumber || null,
+        item.createdAt || new Date().toISOString(),
+        item.updatedAt || new Date().toISOString()
+      );
+    }
+    db.exec('COMMIT');
   } catch (err) {
-    console.error('Error reading inventory.json, returning defaults:', err);
-    return INITIAL_SAMPLE_ITEMS;
+    db.exec('ROLLBACK');
+    throw err;
   }
 }
 
-export function saveInventory(items: InventoryItem[]): void {
-  ensureDataDirectory();
-  const tempFile = `${DATA_FILE}.tmp`;
-  fs.writeFileSync(tempFile, JSON.stringify(items, null, 2), 'utf-8');
-  fs.renameSync(tempFile, DATA_FILE);
+/**
+ * Loads all inventory items from SQLite database.
+ */
+export function loadInventory(): InventoryItem[] {
+  const db = getDatabase();
+  const stmt = db.prepare('SELECT * FROM items ORDER BY created_at DESC');
+  const rows = stmt.all() as unknown as SQLiteItemRow[];
+  return rows.map(rowToItem);
 }
 
+/**
+ * Saves/replaces all inventory items in SQLite database in an atomic transaction.
+ */
+export function saveInventory(items: InventoryItem[]): void {
+  const db = getDatabase();
+  db.exec('BEGIN TRANSACTION');
+  try {
+    db.exec('DELETE FROM items');
+    const insertStmt = db.prepare(`
+      INSERT INTO items (
+        id, name, category, quantity, unit, notes, min_threshold, lot_number, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    for (const item of items) {
+      insertStmt.run(
+        item.id,
+        item.name,
+        item.category,
+        item.quantity,
+        item.unit,
+        item.notes || '',
+        item.minThreshold ?? 0,
+        item.lotNumber || null,
+        item.createdAt,
+        item.updatedAt
+      );
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+}
+
+/**
+ * Resets SQLite database to the initial sample brewery items.
+ */
 export function resetToSampleInventory(): InventoryItem[] {
   saveInventory(INITIAL_SAMPLE_ITEMS);
   return INITIAL_SAMPLE_ITEMS;
+}
+
+/**
+ * Gets a single item by its ID.
+ */
+export function getItemById(id: string): InventoryItem | null {
+  const db = getDatabase();
+  const stmt = db.prepare('SELECT * FROM items WHERE id = ?');
+  const row = stmt.get(id) as unknown as SQLiteItemRow | undefined;
+  return row ? rowToItem(row) : null;
+}
+
+/**
+ * Inserts a single item into SQLite.
+ */
+export function insertItem(item: InventoryItem): InventoryItem {
+  const db = getDatabase();
+  const stmt = db.prepare(`
+    INSERT INTO items (
+      id, name, category, quantity, unit, notes, min_threshold, lot_number, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  stmt.run(
+    item.id,
+    item.name,
+    item.category,
+    item.quantity,
+    item.unit,
+    item.notes || '',
+    item.minThreshold ?? 0,
+    item.lotNumber || null,
+    item.createdAt,
+    item.updatedAt
+  );
+
+  return item;
+}
+
+/**
+ * Updates an existing item in SQLite.
+ */
+export function updateItemInDb(item: InventoryItem): InventoryItem {
+  const db = getDatabase();
+  const stmt = db.prepare(`
+    UPDATE items SET
+      name = ?,
+      category = ?,
+      quantity = ?,
+      unit = ?,
+      notes = ?,
+      min_threshold = ?,
+      lot_number = ?,
+      updated_at = ?
+    WHERE id = ?
+  `);
+
+  stmt.run(
+    item.name,
+    item.category,
+    item.quantity,
+    item.unit,
+    item.notes || '',
+    item.minThreshold ?? 0,
+    item.lotNumber || null,
+    item.updatedAt,
+    item.id
+  );
+
+  return item;
+}
+
+/**
+ * Atomically adjusts quantity of an item by delta.
+ */
+export function quickAdjustQuantity(id: string, delta: number): { item: InventoryItem; previousQuantity: number } | null {
+  const db = getDatabase();
+  db.exec('BEGIN TRANSACTION');
+  try {
+    const getStmt = db.prepare('SELECT * FROM items WHERE id = ?');
+    const row = getStmt.get(id) as unknown as SQLiteItemRow | undefined;
+    if (!row) {
+      db.exec('ROLLBACK');
+      return null;
+    }
+
+    const previousQuantity = row.quantity;
+    const newQuantity = Math.max(0, Math.round((previousQuantity + delta) * 1000) / 1000);
+    const now = new Date().toISOString();
+
+    const updateStmt = db.prepare('UPDATE items SET quantity = ?, updated_at = ? WHERE id = ?');
+    updateStmt.run(newQuantity, now, id);
+
+    db.exec('COMMIT');
+
+    const updatedRow = getStmt.get(id) as unknown as SQLiteItemRow;
+    return {
+      item: rowToItem(updatedRow),
+      previousQuantity,
+    };
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+}
+
+/**
+ * Deletes an item by ID from SQLite.
+ */
+export function deleteItemFromDb(id: string): InventoryItem | null {
+  const db = getDatabase();
+  const getStmt = db.prepare('SELECT * FROM items WHERE id = ?');
+  const row = getStmt.get(id) as unknown as SQLiteItemRow | undefined;
+  if (!row) {
+    return null;
+  }
+
+  const deleteStmt = db.prepare('DELETE FROM items WHERE id = ?');
+  deleteStmt.run(id);
+
+  return rowToItem(row);
 }

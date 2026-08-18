@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for Craft Brewery Inventory Manager
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
@@ -16,7 +16,7 @@ COPY . .
 RUN npm run build
 
 # --- Production Runtime Image ---
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 
 WORKDIR /app
 
@@ -33,7 +33,7 @@ COPY --from=builder /app/dist ./dist
 # Ensure data directory exists for persistent volume mounts and permissions
 RUN mkdir -p /app/data
 
-# Persistent storage volume for inventory JSON database
+# Persistent storage volume for inventory database
 VOLUME ["/app/data"]
 
 EXPOSE 3000
