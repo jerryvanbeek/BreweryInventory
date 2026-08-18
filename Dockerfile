@@ -29,9 +29,8 @@ RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit
 
 # Copy built assets and bundled server from builder stage
 COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/data ./data
 
-# Ensure data directory exists for persistent volume mounts
+# Ensure data directory exists for persistent volume mounts and permissions
 RUN mkdir -p /app/data
 
 # Persistent storage volume for inventory JSON database
