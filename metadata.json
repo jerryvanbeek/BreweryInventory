@@ -1,0 +1,6 @@
+{
+  "name": "Craft Brewery Inventory",
+  "description": "Lightweight inventory management system for craft breweries to track malts, hops, yeast, and misc ingredients with quick quantity adjustments.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

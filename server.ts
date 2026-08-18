@@ -1,0 +1,252 @@
+import express, { Request, Response } from 'express';
+import path from 'path';
+import crypto from 'crypto';
+import { createServer as createViteServer } from 'vite';
+import { loadInventory, saveInventory, resetToSampleInventory } from './server/storage';
+import { InventoryCategory, InventoryItem } from './src/types';
+
+const VALID_CATEGORIES: InventoryCategory[] = ['Malts', 'Hops', 'Yeast', 'Misc'];
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  app.use(express.json({ limit: '10mb' }));
+
+  // --- API Routes ---
+
+  // Health check
+  app.get('/api/health', (req: Request, res: Response) => {
+    res.json({ status: 'ok', time: new Date().toISOString() });
+  });
+
+  // Get all inventory items
+  app.get('/api/inventory', (req: Request, res: Response) => {
+    try {
+      const items = loadInventory();
+      res.json({ success: true, items });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message || 'Failed to read inventory' });
+    }
+  });
+
+  // Get single inventory item
+  app.get('/api/inventory/:id', (req: Request, res: Response) => {
+    const items = loadInventory();
+    const item = items.find((i) => i.id === req.params.id);
+    if (!item) {
+      return res.status(404).json({ success: false, error: 'Item not found' });
+    }
+    res.json({ success: true, item });
+  });
+
+  // Add new inventory item
+  app.post('/api/inventory', (req: Request, res: Response) => {
+    const { name, category, quantity, unit, notes, minThreshold, lotNumber } = req.body;
+
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ success: false, error: 'Item Name is required' });
+    }
+
+    if (!VALID_CATEGORIES.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        error: `Category must be one of: ${VALID_CATEGORIES.join(', ')}`,
+      });
+    }
+
+    const numQty = parseFloat(quantity);
+    if (isNaN(numQty) || numQty < 0) {
+      return res.status(400).json({ success: false, error: 'Quantity must be a valid non-negative number' });
+    }
+
+    if (!unit || typeof unit !== 'string' || !unit.trim()) {
+      return res.status(400).json({ success: false, error: 'Unit of Measurement is required' });
+    }
+
+    const items = loadInventory();
+    const now = new Date().toISOString();
+    const newItem: InventoryItem = {
+      id: `item-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+      name: name.trim(),
+      category: category as InventoryCategory,
+      quantity: Math.round(numQty * 1000) / 1000,
+      unit: unit.trim(),
+      notes: typeof notes === 'string' ? notes.trim() : '',
+      minThreshold: minThreshold !== undefined && !isNaN(parseFloat(minThreshold)) ? Math.max(0, parseFloat(minThreshold)) : 0,
+      lotNumber: typeof lotNumber === 'string' ? lotNumber.trim() : undefined,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    items.unshift(newItem);
+    saveInventory(items);
+
+    res.status(201).json({ success: true, item: newItem });
+  });
+
+  // Update existing inventory item
+  app.put('/api/inventory/:id', (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { name, category, quantity, unit, notes, minThreshold, lotNumber } = req.body;
+
+    const items = loadInventory();
+    const index = items.findIndex((i) => i.id === id);
+    if (index === -1) {
+      return res.status(404).json({ success: false, error: 'Item not found' });
+    }
+
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ success: false, error: 'Item Name is required' });
+    }
+
+    if (!VALID_CATEGORIES.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        error: `Category must be one of: ${VALID_CATEGORIES.join(', ')}`,
+      });
+    }
+
+    const numQty = parseFloat(quantity);
+    if (isNaN(numQty) || numQty < 0) {
+      return res.status(400).json({ success: false, error: 'Quantity must be a valid non-negative number' });
+    }
+
+    if (!unit || typeof unit !== 'string' || !unit.trim()) {
+      return res.status(400).json({ success: false, error: 'Unit of Measurement is required' });
+    }
+
+    const existing = items[index];
+    const updatedItem: InventoryItem = {
+      ...existing,
+      name: name.trim(),
+      category: category as InventoryCategory,
+      quantity: Math.round(numQty * 1000) / 1000,
+      unit: unit.trim(),
+      notes: typeof notes === 'string' ? notes.trim() : '',
+      minThreshold: minThreshold !== undefined && !isNaN(parseFloat(minThreshold)) ? Math.max(0, parseFloat(minThreshold)) : 0,
+      lotNumber: typeof lotNumber === 'string' ? lotNumber.trim() : undefined,
+      updatedAt: new Date().toISOString(),
+    };
+
+    items[index] = updatedItem;
+    saveInventory(items);
+
+    res.json({ success: true, item: updatedItem });
+  });
+
+  // Quick adjust quantity (+1, +5, -1, -5, etc.)
+  app.patch('/api/inventory/:id/adjust', (req: Request, res: Response) => {
+    const { id } = req.params;
+    const { delta } = req.body;
+
+    const numDelta = parseFloat(delta);
+    if (isNaN(numDelta)) {
+      return res.status(400).json({ success: false, error: 'Delta must be a valid number' });
+    }
+
+    const items = loadInventory();
+    const index = items.findIndex((i) => i.id === id);
+    if (index === -1) {
+      return res.status(404).json({ success: false, error: 'Item not found' });
+    }
+
+    const currentQty = items[index].quantity;
+    const newQty = Math.max(0, Math.round((currentQty + numDelta) * 1000) / 1000);
+
+    items[index] = {
+      ...items[index],
+      quantity: newQty,
+      updatedAt: new Date().toISOString(),
+    };
+
+    saveInventory(items);
+
+    res.json({ success: true, item: items[index], previousQuantity: currentQty });
+  });
+
+  // Delete inventory item
+  app.delete('/api/inventory/:id', (req: Request, res: Response) => {
+    const { id } = req.params;
+    const items = loadInventory();
+    const index = items.findIndex((i) => i.id === id);
+    if (index === -1) {
+      return res.status(404).json({ success: false, error: 'Item not found' });
+    }
+
+    const [deleted] = items.splice(index, 1);
+    saveInventory(items);
+
+    res.json({ success: true, deletedItem: deleted });
+  });
+
+  // Reset to initial sample brewery inventory
+  app.post('/api/inventory/reset-sample', (req: Request, res: Response) => {
+    const sampleItems = resetToSampleInventory();
+    res.json({ success: true, items: sampleItems });
+  });
+
+  // Export JSON backup
+  app.get('/api/inventory/export', (req: Request, res: Response) => {
+    const items = loadInventory();
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', 'attachment; filename="brewery-inventory-backup.json"');
+    res.send(JSON.stringify(items, null, 2));
+  });
+
+  // Import JSON backup
+  app.post('/api/inventory/import', (req: Request, res: Response) => {
+    const { items } = req.body;
+    if (!Array.isArray(items)) {
+      return res.status(400).json({ success: false, error: 'Expected array of inventory items' });
+    }
+
+    const validItems: InventoryItem[] = [];
+    for (const item of items) {
+      if (item && item.name && VALID_CATEGORIES.includes(item.category) && typeof item.quantity === 'number') {
+        validItems.push({
+          id: item.id || `item-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+          name: String(item.name).trim(),
+          category: item.category,
+          quantity: Math.max(0, Number(item.quantity)),
+          unit: String(item.unit || 'items').trim(),
+          notes: item.notes ? String(item.notes).trim() : '',
+          minThreshold: item.minThreshold !== undefined ? Number(item.minThreshold) : 0,
+          lotNumber: item.lotNumber ? String(item.lotNumber).trim() : undefined,
+          createdAt: item.createdAt || new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    if (validItems.length === 0) {
+      return res.status(400).json({ success: false, error: 'No valid inventory items found in import payload' });
+    }
+
+    saveInventory(validItems);
+    res.json({ success: true, items: validItems, importedCount: validItems.length });
+  });
+
+  // --- Frontend Vite Integration ---
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req: Request, res: Response) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Brewery Inventory Server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error('Failed to start server:', err);
+});

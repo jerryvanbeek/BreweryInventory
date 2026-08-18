@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #F9F8F6;
+  --ink: #1A1A1A;
+  --brew-orange: #E67E22;
+  --brew-gold: #F1C40F;
+  --line: #D1CFCA;
+  --sidebar-bg: #F1EFE9;
+  --stats-bg: #EEECE7;
+  --pill-bg: #E0DED7;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Monospace font utility for quantities and codes */
+.font-mono-dense {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom scrollbars for high density viewport */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #F1EFE9;
+}
+::-webkit-scrollbar-thumb {
+  background: #D1CFCA;
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #1A1A1A;
+}
